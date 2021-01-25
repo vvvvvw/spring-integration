@@ -46,6 +46,14 @@ import org.springframework.util.Assert;
 import org.springframework.util.ReflectionUtils;
 
 /**
+ * 使用redis实现了一个具有超时机制的分布式锁，锁的key为registryKey:lockKey，锁默认在60s之后超时
+ * 线程解锁一个 已经超时的锁 会发生 IllegalStateException（有三种情况会发生解锁时发现锁不存在的情况：
+ * 1.key超时，2.key因为redis故障或者认为删除，3.），这种情况应该被视为是一个严重的错误，因为
+ * 可能发生了 资源访问冲突
+ * 锁是可以重入的
+ * 然而，锁以registry来区分，来自不同的registry但是相同的key(即使具有相同的registryKey）也属于不同的锁，
+ * 如果第一个锁被锁住的话，同一个线程也不能获取第二次锁
+ * 注意：本分布式锁不适用于低延迟的应用
  * Implementation of {@link ExpirableLockRegistry} providing a distributed lock using Redis.
  * Locks are stored under the key {@code registryKey:lockKey}. Locks expire after
  * (default 60) seconds. Threads unlocking an
@@ -77,8 +85,13 @@ public final class RedisLockRegistry implements ExpirableLockRegistry, Disposabl
 
 	private static final Log logger = LogFactory.getLog(RedisLockRegistry.class);
 
+	//默认超时时间，60s
 	private static final long DEFAULT_EXPIRE_AFTER = 60000L;
 
+	//脚本 如果key(1)对应的值为clientId，则设置超时时间，并返回true
+	// 如果没有对应值，也返回true，并设置超时时间，如果对应的值不为clientId(已经有其他人获取锁)，
+	//返回false
+	//keys(1):加锁的key, 参数: 本次加锁的ClientId 、超时时间(精确到毫秒)
 	private static final String OBTAIN_LOCK_SCRIPT =
 			"local lockClientId = redis.call('GET', KEYS[1])\n" +
 					"if lockClientId == ARGV[1] then\n" +
@@ -91,24 +104,31 @@ public final class RedisLockRegistry implements ExpirableLockRegistry, Disposabl
 					"return false";
 
 
+	//Map<lockKey, 锁> 存储所有被获取的redis分布式锁
 	private final Map<String, RedisLock> locks = new ConcurrentHashMap<>();
 
+	//本锁的uuid,用来标识是这个registry注册的锁
 	private final String clientId = UUID.randomUUID().toString();
 
+	//redis的key: registryKey:lockKey
 	private final String registryKey;
 
 	private final boolean unlinkAvailable;
 
+	//redis属性
 	private final StringRedisTemplate redisTemplate;
 
+	//redis script脚本
 	private final RedisScript<Boolean> obtainLockScript;
 
+	//在什么时候超时
 	private final long expireAfter;
 
 	/**
 	 * An {@link ExecutorService} to call {@link StringRedisTemplate#delete(Object)} in
 	 * the separate thread when the current one is interrupted.
 	 */
+	//如果当前线程被中断，会在另一个线程池中执行 delete操作
 	private Executor executor =
 			Executors.newCachedThreadPool(new CustomizableThreadFactory("redis-lock-registry-"));
 
@@ -116,6 +136,7 @@ public final class RedisLockRegistry implements ExpirableLockRegistry, Disposabl
 	 * Flag to denote whether the {@link ExecutorService} was provided via the setter and
 	 * thus should not be shutdown when {@link #destroy()} is called
 	 */
+	//是否线程池是外部提供的，因此在destroy方法中不能关闭线程池
 	private boolean executorExplicitlySet;
 
 	/**
@@ -183,12 +204,14 @@ public final class RedisLockRegistry implements ExpirableLockRegistry, Disposabl
 
 	private final class RedisLock implements Lock {
 
+		//lockKey: registryKey + ":" + path
 		private final String lockKey;
 
 		private final ReentrantLock localLock = new ReentrantLock();
 
 		private final boolean unlinkAvailable = RedisLockRegistry.this.unlinkAvailable;
 
+		//最晚一次上锁时间
 		private volatile long lockedAt;
 
 		private RedisLock(String path) {
@@ -284,7 +307,7 @@ public final class RedisLockRegistry implements ExpirableLockRegistry, Disposabl
 			}
 			return false;
 		}
-
+		//是否成功设置锁
 		private boolean obtainLock() {
 			Boolean success =
 					RedisLockRegistry.this.redisTemplate.execute(RedisLockRegistry.this.obtainLockScript,
